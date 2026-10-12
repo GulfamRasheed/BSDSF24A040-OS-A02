@@ -1,64 +1,215 @@
 /*
- * lsv1.1.0.c  --  Feature-2: Complete Long Listing Format (-l)
+ * ls-v1.2.0.c  --  Feature-3: Column Display, "Down Then Across"
  *
- * BASE: the instructor's lsv1.0.0 (Programming-Assignments/PA-02).
- * We KEEP its structure deliberately - same function name `do_ls()`, same
- * argument loop in main(), same dotfile filtering - and only add the -l
- * branch inside do_ls() plus the helper functions the long format needs.
+ * BASE: the instructor's lsv1.0.0. do_ls() keeps its name and its role,
+ * but is split into two phases (read everything, then print) because the
+ * column width depends on the LONGEST filename and cannot be known until
+ * the last entry has been seen.
  *
  * NEW IN THIS VERSION
- *   -l long listing that mirrors `ls -l`.
+ *   Default output is multi-column and adapts to the terminal width.
  *
- * NEW SYSTEM CALLS / FUNCTIONS USED
- *   getopt()    - POSIX option parser
- *   lstat()     - metadata WITHOUT following symlinks
- *   getpwuid()  - uid  -> username     (from /etc/passwd)
- *   getgrgid()  - gid  -> groupname    (from /etc/group)
- *   ctime()     - time_t -> "Www Mmm dd hh:mm:ss yyyy"
- *   readlink()  - target of a symbolic link
+ * NEW CONCEPTS
+ *   Dynamic array    - realloc() doubling, so memory grows with the
+ *                       directory instead of being a fixed guess.
+ *   ioctl(TIOCGWINSZ) - ask the kernel how wide the terminal is.
+ *   Down-then-across - print column-major: fill a column top to bottom,
+ *                       then move to the next column.
  *
- * WHY lstat() AND NOT stat()?
- *   stat()   FOLLOWS symlinks: for a link to /etc/passwd it returns the
- *            metadata of /etc/passwd itself.
- *   lstat()  does NOT follow: it returns the metadata of the LINK itself
- *            (st_mode has S_IFLNK set). `ls -l` must print 'l' in the first
- *            permission column for a symlink, so lstat() is the correct call.
+ * NEW SYSTEM CALLS
+ *   ioctl()   - device control; TIOCGWINSZ returns a struct winsize
+ *   realloc() - resize a heap block, copying the old contents
  */
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <time.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <getopt.h>
 #include <pwd.h>
 #include <grp.h>
-#include <string.h>
-#include <errno.h>
-#include <time.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>     /* struct winsize, TIOCGWINSZ */
 
-/*
- * Option state. `static` keeps it private to this file. It must be global
- * (not a local of main) because do_ls() is a separate function and C has
- * no closures, so there is no other way for the two to share it.
- */
 static int opt_long = 0;
 
+/* --- constants --------------------------------------------------------- */
+#define NAME_SPACING 2      /* blank columns between adjacent columns      */
+#define FALLBACK_WIDTH 80   /* used when the real terminal width is unknown */
+
 /*
- * Convert st_mode into the familiar 10-character "rwxr-xr-x" string.
+ * A growable array of C strings.
  *
- * WHY THIS WORKS
- *   st_mode packs THREE kinds of information into one integer:
- *     (1) file type       -> high bits, e.g. S_IFDIR, S_IFREG, S_IFLNK
- *     (2) permission bits -> low bits,  e.g. S_IRUSR, S_IWGRP, S_IXOTH
- *     (3) special bits    -> S_ISUID, S_ISGID, S_ISVTX
- *
- *   Each field occupies disjoint bit positions, so any one of them can be
- *   extracted with a bitwise AND. `mode & S_IRUSR` yields the bit itself
- *   when it is set and 0 when it is clear, so it works directly as a
- *   boolean. That is the whole trick: an AND with a one-bit mask is a bit
- *   test in disguise.
+ * WHY strdup() AND NOT &name[i]?
+ *   readdir() REUSES one internal `struct dirent` buffer every call, so
+ *   the d_name pointer is overwritten on the next iteration. Storing that
+ *   pointer would leave every array slot pointing at the LAST name read.
+ *   strdup() allocates heap memory and copies the bytes, so each slot owns
+ *   an independent string. Every strdup() MUST have a matching free().
  */
+typedef struct {
+    char **names;       /* array of pointers to filenames */
+    size_t count;       /* how many entries are filled in   */
+    size_t capacity;    /* how many slots allocated so far  */
+    size_t max_len;     /* length of the longest filename   */
+} NameList;
+
+static void namelist_init(NameList *nl)
+{
+    nl->names = NULL;
+    nl->count = 0;
+    nl->capacity = 0;
+    nl->max_len = 0;
+}
+
+/* Append one filename, growing the array geometrically when it is full. */
+static void namelist_push(NameList *nl, const char *name)
+{
+    if (nl->count == nl->capacity) {
+        size_t new_cap = (nl->capacity == 0) ? 8 : nl->capacity * 2;
+        char **tmp = realloc(nl->names, new_cap * sizeof(char *));
+
+        if (tmp == NULL) {
+            /* realloc failure: the ORIGINAL pointer is still valid and
+               still owned by us, so we must not overwrite nl->names or we
+               would leak it. */
+            perror("realloc");
+            exit(EXIT_FAILURE);
+        }
+        nl->names = tmp;
+        nl->capacity = new_cap;
+    }
+
+    nl->names[nl->count] = strdup(name);
+    if (nl->names[nl->count] == NULL) {
+        perror("strdup");
+        exit(EXIT_FAILURE);
+    }
+
+    if (strlen(name) > nl->max_len)
+        nl->max_len = strlen(name);
+
+    nl->count++;
+}
+
+/* Release every string and the array itself. */
+static void namelist_free(NameList *nl)
+{
+    size_t i;
+    for (i = 0; i < nl->count; i++) {
+        free(nl->names[i]);   /* the string */
+    }
+    free(nl->names);          /* the array  */
+    namelist_init(nl);
+}
+
+/* --- terminal size ----------------------------------------------------- */
+
+/*
+ * Ask the kernel how many columns the terminal has.
+ *
+ * ioctl() is the generic "device control" entry point. The constant
+ * TIOCGWINSZ ("Terminal Input/Output Get Window Size") tells the terminal
+ * driver which piece of information we want; it fills in `struct winsize`
+ * whose ws_col member holds the column count.
+ *
+ * WHY ioctl() AND NOT system("tput cols")?
+ *   system() would fork a shell, run tput and parse its output on every
+ *   invocation. ioctl() is a single syscall with no process spawn.
+ *
+ * Returns 0 on failure, in which case the caller falls back to a constant.
+ */
+static int terminal_width(void)
+{
+    struct winsize ws;
+
+    /* STDOUT_FILENO is fd 1. We query fd 1 because that is the stream the
+       output will actually go to. */
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
+        return FALLBACK_WIDTH;
+    }
+    return ws.ws_col;
+}
+
+/*
+ * Print the name list in GNU ls "down then across" order.
+ *
+ * THE ALGORITHM, STEP BY STEP
+ *   width     = terminal columns
+ *   col_width = longest filename + NAME_SPACING   (every column is this
+ *               wide so that they line up)
+ *   num_cols  = width / col_width                (how many fit)
+ *   num_rows  = (count + num_cols - 1) / num_cols (ceiling division)
+ *
+ *   A single loop `for i in 0..count` prints FILES left-to-right, which is
+ *   "across then down" and looks wrong: the last column would be ragged
+ *   and the row contents would shift every time the terminal is resized.
+ *
+ *   "Down then across" fills column 0 top to bottom, then column 1, etc.
+ *   With N rows, the element at (row r, column c) is simply:
+ *
+ *              index = c * num_rows + r
+ *
+ *   So we loop ROW-first on the outside and COLUMN-second on the inside:
+ *       for r in 0..num_rows:  for c in 0..num_cols:  print names[c*num_rows + r]
+ *
+ *   GNU ls puts any leftover entries in the FIRST columns, so early
+ *   columns are one row taller. The `c * num_rows + r` formula plus
+ *   bounds-checking reproduces that automatically.
+ */
+static void print_columns(const NameList *nl)
+{
+    int width = terminal_width();
+    size_t col_width;
+    size_t num_cols;
+    size_t num_rows;
+    size_t r, c;
+
+    if (nl->count == 0)
+        return;
+
+    /* Guard against a single filename longer than the terminal: at least
+       one column, and shrink the width so we never divide by zero. */
+    col_width = nl->max_len + NAME_SPACING;
+    if ((size_t)width <= col_width) {
+        /* Names too wide to share a line - print one per line. */
+        size_t i;
+        for (i = 0; i < nl->count; i++)
+            printf("%s\n", nl->names[i]);
+        return;
+    }
+
+    num_cols = (size_t)width / col_width;
+    /* Ceiling division: (a + b - 1) / b rounds a/b up. */
+    num_rows = (nl->count + num_cols - 1) / num_cols;
+
+    for (r = 0; r < num_rows; r++) {
+        for (c = 0; c < num_cols; c++) {
+            size_t idx = c * num_rows + r;
+
+            if (idx >= nl->count)
+                continue;              /* ragged last column */
+
+            /* TRAILING-WHITESPACE FIX.
+               Pad only when a REAL item further along this row exists:
+                 - a next column exists on this row     (c + 1 < num_cols)
+                 - that next column actually has a name (idx+num_rows < count)
+               Padding the final item of a row would leave spaces at the
+               end of the line, which real ls never emits. */
+            if (c + 1 < num_cols && idx + num_rows < nl->count)
+                printf("%-*s", (int)col_width, nl->names[idx]);
+            else
+                printf("%s", nl->names[idx]);
+        }
+        putchar('\n');
+    }
+}
+
+/* --- long listing (unchanged from v1.1.0) ------------------------------ */
+
 static void mode_to_perms(mode_t mode, char *out)
 {
     const char *rwx = "rwxrwxrwx";
@@ -179,57 +330,59 @@ static void print_long_entry(const char *path, const char *name)
     printf("\n");
 }
 
-/* ---- unchanged from the base version ----------------------------------- */
+/* ------------------------------------------------------------------------ */
 
-void do_ls(const char *dir)
+static void do_ls(const char *path)
 {
+    DIR *dir;
     struct dirent *entry;
-    DIR *dp = opendir(dir);
-    if (dp == NULL)
-    {
-        fprintf(stderr, "Cannot open directory : %s\n", dir);
+    NameList nl;
+
+    dir = opendir(path);
+    if (dir == NULL) {
+        perror(path);
         return;
     }
+
+    namelist_init(&nl);
+
+    /*
+     * PHASE 1 - READ EVERYTHING.
+     * We cannot start printing until we know the LONGEST filename, because
+     * the column width depends on it. So the whole directory is slurped
+     * into memory first, and only then printed.
+     */
     errno = 0;
-    while ((entry = readdir(dp)) != NULL)
-    {
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
         if (entry->d_name[0] == '.')
             continue;
-
-        if (opt_long) {
-            /*
-             * lstat() resolves relative names against the process CWD, not
-             * against `dir`, so we must hand it "<dir>/<name>". snprintf
-             * bounds the write; an unbounded sprintf here is a textbook
-             * buffer-overflow bug.
-             */
-            char full[4096];
-            snprintf(full, sizeof(full), "%s/%s", dir, entry->d_name);
-            print_long_entry(full, entry->d_name);
-        } else {
-            printf("%s\n", entry->d_name);
-        }
+        namelist_push(&nl, entry->d_name);
     }
-
     if (errno != 0)
-    {
-        perror("readdir failed");
+        perror("readdir");
+    closedir(dir);
+
+    /* PHASE 2 - PRINT. */
+    if (opt_long) {
+        size_t i;
+        for (i = 0; i < nl.count; i++) {
+            char full[4096];
+            snprintf(full, sizeof(full), "%s/%s", path, nl.names[i]);
+            print_long_entry(full, nl.names[i]);
+        }
+    } else {
+        print_columns(&nl);
     }
 
-    closedir(dp);
+    namelist_free(&nl);
 }
 
 int main(int argc, char const *argv[])
 {
     int opt;
 
-    /*
-     * getopt() hands back one recognised option letter at a time. "l" in the
-     * optstring means 'l' is a valid option and takes NO argument (a ':'
-     * after it would mean it does). '?' means an unknown option, which we
-     * reject. On return, optind is the index of the first NON-option
-     * argument - the first directory the user wants listed.
-     */
     /*
      * The cast is required, not cosmetic: getopt() is declared as
      *     int getopt(int, char *const *, const char *)
@@ -243,9 +396,7 @@ int main(int argc, char const *argv[])
 
     while ((opt = getopt(argc, (char *const *)argv, "l")) != -1) {
         switch (opt) {
-            case 'l':
-                opt_long = 1;
-                break;
+            case 'l': opt_long = 1; break;
             case '?':
             default:
                 fprintf(stderr, "Usage: %s [-l] [DIRECTORY]...\n", argv[0]);
@@ -253,6 +404,8 @@ int main(int argc, char const *argv[])
         }
     }
 
+    /* Same argument handling as the base version: no argument means the
+       current directory; otherwise list every directory given. */
     if (optind >= argc) {
         do_ls(".");
     } else {
