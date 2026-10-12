@@ -1,24 +1,19 @@
 /*
- * ls-v1.5.0.c  --  Feature-6: Colorized Output Based on File Type
+ * ls-v1.6.0.c  --  Feature-7: Recursive Listing (-R)   [FINAL VERSION]
  *
  * NEW IN THIS VERSION
- *   Filenames are printed in a colour determined by the file's type:
- *     directory      -> bold blue
- *     executable     -> green
- *     archive        -> red
- *     symlink        -> magenta (pink)
- *     special file   -> reverse video
+ *   -R descends into every subdirectory it finds, printing a header for
+ *   each one, exactly like `ls -R`.
  *
  * NEW CONCEPTS
- *   ANSI escape codes - the terminal emulates a text display, not a
- *                       graphics one. Colour is produced by printing a
- *                       short control string the terminal INTERPRETS
- *                       rather than displays.
- *   S_ISREG/S_ISDIR/... - macros that test the st_mode type bits.
+ *   Recursion    - do_ls() calls itself with a deeper path.
+ *   Base case    - the condition that stops the recursion. Ours is
+ *                   "the current path is not a directory", plus the
+ *                   explicit skip of "." and "..".
+ *   Path building - joining "parent" + "/" + "child" into a new buffer.
  *
- * INHERITED FROM v1.4.0
- *   Dynamic array, ioctl terminal width, all three display modes,
- *   alphabetical sort, and the complete -l long listing.
+ * INHERITED FROM v1.5.0
+ *   Everything: dynamic array, ioctl width, -l, -x, qsort, ANSI colours.
  */
 
 #include <stdio.h>
@@ -37,11 +32,11 @@
 /*
  * Display mode.
  *
- * We replace the `int opt_long` boolean with an enum because there are now
- * THREE mutually exclusive states. A boolean cannot express "neither of the
- * two things I have flags for", so with two booleans we would also need
- * extra code to decide which one wins when both are set. An enum makes the
- * state space explicit and impossible to contradict.
+ * We replaced the old `int opt_long` boolean with an enum because we now
+ * have THREE mutually exclusive states. A boolean cannot express "neither
+ * of the two things I have flags for", so with two booleans we would also
+ * need extra code to decide which one wins when both are set. An enum makes
+ * the state space explicit and impossible to contradict.
  */
 typedef enum {
     MODE_COLUMN,    /* default : down then across */
@@ -50,6 +45,19 @@ typedef enum {
 } DisplayMode;
 
 static DisplayMode display_mode = MODE_COLUMN;
+
+/*
+ * -R state. This is a SEPARATE boolean, not a fourth enum value, because
+ * recursion is an ORTHOGONAL concern: it modifies all three display modes
+ * at once, whereas display_mode chooses between them. So `ls -lR` must be
+ * able to mean MODE_LONG *and* recursion simultaneously. Encoding it as a
+ * fourth enum value would create eight combinations, of which five are
+ * meaningless.
+ */
+static int recursive = 0;
+
+/* Guards against symlink loops and pathological trees (see do_ls). */
+static int depth_limit = 64;
 
 /* --- constants --------------------------------------------------------- */
 #define NAME_SPACING 2      /* blank columns between adjacent columns      */
@@ -116,36 +124,37 @@ static void namelist_push(NameList *nl, const char *name)
  * SIGNATURE
  *     int cmp_names(const void *a, const void *b);
  *
- * The prototype is fixed by the C standard because qsort must call a
- * function whose argument types it cannot know - it sorts a byte range of
- * unknown element type.
+ * The prototype is fixed by the C standard because qsort must be able to
+ * call a function whose argument types it cannot know - it is sorting a
+ * byte range of unknown element type.
  *
  * WHAT QSORT PASSES
- *     qsort sorts ELEMENTS, and for each comparison it hands us the
- *     ADDRESSES OF TWO ELEMENTS. Our elements are `char *`, so each
- *     argument is really a `char **` and the cast happens TWICE:
+ *     qsort sorts an array of ELEMENTS, and for each comparison it hands
+ *     us the ADDRESSES OF TWO ELEMENTS. Our elements are `char *`, so
+ *     `a` is really a `char **`. The cast therefore has to go:
  *
- *         a  -->  (char **)    points AT our char * slot
- *           |
- *           +-->  (char *)     dereference to reach the string itself
+ *         a --> (char **)   now points AT our char * slot
+ *          |
+ *          +--> (char *)   dereference to get the string itself
  *
- *     Getting one dereference wrong is the classic bug when sorting an
- *     array of pointers with qsort.
+ *     Getting one dereference wrong is the single most common bug when
+ *     sorting an array of pointers with qsort.
  *
  * WHY const void *
  *     - void *  : qsort has no idea whether the array holds int, double or
  *                 char *, so it can only pass a generic pointer.
- *     - const  : qsort SORTS IN PLACE but never modifies the elements. The
- *                 const is a promise to the caller that we only read them,
- *                 and it lets the function be used on a const array.
+ *     - const  : qsort SORTS IN PLACE and never modifies the elements.
+ *                 Declaring the parameter const is a promise to the caller
+ *                 that we will only read them. It also means our function
+ *                 can legally be used with a genuinely const array.
  *
- * RETURN CONTRACT
- *     < 0  if *a sorts before *b
- *     = 0  if equal
- *     > 0  if *a sorts after *b
+ * THE COMPARISON CONTRACT
+ *     return < 0   if *a sorts BEFORE *b
+ *     return  0    if they are equal
+ *     return > 0   if *a sorts AFTER *b
  *     We must never return (a - b): that is arithmetic on unrelated
- *     addresses, which is undefined behaviour. strcmp() already returns
- *     exactly the value we need.
+ *     addresses, which is undefined behaviour and can overflow. strcmp()
+ *     already returns exactly the value we need.
  */
 static int cmp_names(const void *a, const void *b)
 {
@@ -161,9 +170,9 @@ static void namelist_free(NameList *nl)
 {
     size_t i;
     for (i = 0; i < nl->count; i++) {
-        free(nl->names[i]);   /* the string */
+        free(nl->names[i]);   /* the string   */
     }
-    free(nl->names);          /* the array  */
+    free(nl->names);          /* the array    */
     namelist_init(nl);
 }
 
@@ -199,15 +208,15 @@ static int terminal_width(void)
  * Print the name list in GNU ls "down then across" order.
  *
  * THE ALGORITHM, STEP BY STEP
- *   width     = terminal columns
- *   col_width = longest filename + NAME_SPACING   (every column is this
- *               wide so that they line up)
- *   num_cols  = width / col_width                (how many fit)
- *   num_rows  = (count + num_cols - 1) / num_cols (ceiling division)
+ *   width      = terminal columns
+ *   col_width  = longest filename + NAME_SPACING   (every column is this
+ *                wide so they line up)
+ *   num_cols   = width / col_width               (how many fit)
+ *   num_rows   = (count + num_cols - 1) / num_cols (ceiling division)
  *
  *   A single loop `for i in 0..count` prints FILES left-to-right, which is
  *   "across then down" and looks wrong: the last column would be ragged
- *   and the row contents would shift every time the terminal is resized.
+ *   and the row contents shift every time the terminal is resized.
  *
  *   "Down then across" fills column 0 top to bottom, then column 1, etc.
  *   With N rows, the element at (row r, column c) is simply:
@@ -535,138 +544,99 @@ static void print_across(const NameList *nl, const char *path)
     /* Trailing newline so the shell prompt starts on a fresh line. */
     putchar('\n');
 }
+
 /* --- long listing (unchanged from v1.1.0) ------------------------------ */
 
-static void mode_to_perms(mode_t mode, char *out)
+static void mode_to_perms(mode_t mode, char out[11])
 {
     const char *rwx = "rwxrwxrwx";
+    int i;
 
-    /* The nine permission bits, in printing order: owner rwx, group rwx,
-       other rwx. Bit 8 is "owner read" and maps to rwx[0]; bit 0 is "other
-       execute" and maps to rwx[8]. Hence the (8 - i) shift. */
-    for (int i = 0; i < 9; i++)
+    for (i = 0; i < 9; i++)
         out[i] = (mode & (1 << (8 - i))) ? rwx[i] : '-';
     out[9] = '\0';
 
-    /* The FIRST character is the file type, not 'r'. */
     if (S_ISDIR(mode))       out[0] = 'd';
     else if (S_ISLNK(mode))  out[0] = 'l';
     else if (S_ISCHR(mode))  out[0] = 'c';
     else if (S_ISBLK(mode))  out[0] = 'b';
     else if (S_ISFIFO(mode)) out[0] = 'p';
     else if (S_ISSOCK(mode)) out[0] = 's';
-    /* else it stays 'r' -> a regular file */
 
-    /*
-     * SPECIAL BITS overwrite the execute character they share a position
-     * with. GNU ls uses lower case when the execute bit is ALSO set and
-     * upper case when it is not:
-     *     setuid + executable -> 's'   setuid + not executable -> 'S'
-     */
     if (mode & S_ISUID) out[2] = (mode & S_IXUSR) ? 's' : 'S';
     if (mode & S_ISGID) out[5] = (mode & S_IXGRP) ? 's' : 'S';
     if (mode & S_ISVTX) out[8] = (mode & S_IXOTH) ? 't' : 'T';
 }
 
-/*
- * Format st_mtime the way `ls -l` does:
- *     "Mar  5 14:30"   recent files  (time of day)
- *     "Mar  5  2024"   older files   (year)
- *
- * ctime() returns a fixed-layout 24-character string:
- *     "Tue Mar  5 14:30:07 2024"
- *      012 4   8 11    14      20
- * We slice that layout instead of using strftime(), because strftime's
- * output also depends on the locale and would then differ from real ls.
- */
-static void format_mtime(time_t mtime, char *buf)
+static void format_mtime(time_t mtime, char *buf, size_t bufsz)
 {
     char *raw = ctime(&mtime);
     char month[4];
 
     if (raw == NULL) {
-        snprintf(buf, 16, "            ");
+        snprintf(buf, bufsz, "            ");
         return;
     }
 
     memcpy(month, raw + 4, 3);
     month[3] = '\0';
 
-    if (mtime > time(NULL) - 15552000L) {     /* ~6 months */
-        snprintf(buf, 16, "%s %2d %02d:%02d",
+    if (mtime > time(NULL) - 15552000L) {
+        snprintf(buf, bufsz, "%s %2d %02d:%02d",
                  month, atoi(raw + 8), atoi(raw + 11), atoi(raw + 14));
     } else {
-        snprintf(buf, 16, "%s %2d  %s", month, atoi(raw + 8), raw + 20);
+        snprintf(buf, bufsz, "%s %2d  %s", month, atoi(raw + 8), raw + 20);
     }
 }
 
-/*
- * Print ONE file in long format.
- *
- * getpwuid() / getgrgid() return a pointer to a STATIC buffer that the
- * NEXT call overwrites. We must therefore never free() it, and we must
- * copy the string out if it has to outlive the call. Here we only print it
- * straight away, so that is safe.
- */
 static void print_long_entry(const char *path, const char *name)
 {
-    struct stat info;
+    struct stat st;
     char perms[11];
-    char timebuf[16];
-    struct passwd *pwd;
-    struct group  *grp;
+    char timebuf[32];
+    struct passwd *pw;
+    struct group  *gr;
 
-    if (lstat(path, &info) != 0) {
-        /* A file can disappear between readdir() and lstat(); that is not
-           fatal for the whole listing, so report it and carry on. */
+    if (lstat(path, &st) != 0) {
         fprintf(stderr, "ls: cannot access '%s': %s\n", path, strerror(errno));
         return;
     }
 
-    mode_to_perms(info.st_mode, perms);
-    format_mtime(info.st_mtime, timebuf);
+    mode_to_perms(st.st_mode, perms);
+    format_mtime(st.st_mtime, timebuf, sizeof(timebuf));
 
-    errno = 0;
-    pwd = getpwuid(info.st_uid);
-    grp = getgrgid(info.st_gid);
+    pw = getpwuid(st.st_uid);
+    gr = getgrgid(st.st_gid);
 
     /*
-     * Column widths match GNU ls:
-     *   perms 10 | nlink 3 right | user 8 left | group 8 left
-     *   | size 9 right | time 12 | name
-     * The * and - flags of printf are how C does column alignment.
-     */
-    /*
-     * All the metadata columns print plainly; only the NAME is coloured,
-     * and it is coloured from the SAME st_mode fetched above - no second
-     * lstat() call is needed.
+     * All the metadata columns are printed plainly; only the NAME is
+     * coloured, and it is coloured using the SAME st_mode we already
+     * fetched above - no second lstat() call is needed.
      */
     printf("%s %3lu %-8s %-8s %9ld %s ",
-           perms,
-           (unsigned long)info.st_nlink,
-           pwd ? pwd->pw_name : "UNKNOWN",
-           grp ? grp->gr_name : "UNKNOWN",
-           (long)info.st_size,
-           timebuf);
+           perms, (unsigned long)st.st_nlink,
+           pw ? pw->pw_name : "UNKNOWN",
+           gr ? gr->gr_name : "UNKNOWN",
+           (long)st.st_size, timebuf);
 
     if (use_color()) {
-        const char *code = color_for_mode(name, info.st_mode);
+        const char *code = color_for_mode(name, st.st_mode);
         if (code[0] != '\0')
             fputs(code, stdout);
     }
 
-    /* In -l mode the name is the last column, so it needs no padding. */
+    /* In -l mode the name is the last column, so it needs no padding -
+       a width of 0 with pad=0 prints it bare. */
     fputs(name, stdout);
 
     if (use_color())
         fputs(ANSI_RESET, stdout);
 
-    /* Symlinks get "-> target" at the end, exactly like real ls. */
-    if (S_ISLNK(info.st_mode)) {
+    if (S_ISLNK(st.st_mode)) {
         char target[1024];
         ssize_t n = readlink(path, target, sizeof(target) - 1);
         if (n > 0) {
-            target[n] = '\0';       /* readlink does NOT null-terminate */
+            target[n] = '\0';
             printf(" -> %s", target);
         }
     }
@@ -675,25 +645,71 @@ static void print_long_entry(const char *path, const char *name)
 
 /* ------------------------------------------------------------------------ */
 
-static void do_ls(const char *path)
+/*
+ * do_ls()  --  list ONE directory.  This is the function that recurses.
+ *
+ * A BASE CASE is the condition that makes a recursive function stop
+ * calling itself. Ours has three layers, and every real recursive program
+ * needs all three:
+ *
+ *   1. opendir() FAILS.  The path is not a directory, or is unreadable.
+ *      This is the primary base case: recursion only continues into
+ *      things we have ALREADY proven are directories, so by construction
+ *      every call should succeed - the check is what makes the function
+ *      safe when called directly from main() on a plain file argument.
+ *
+ *   2. "." AND ".." ARE SKIPPED.  These are the special entries through
+ *      which a directory points at itself and at its parent. Following
+ *      either would make the tree infinite: ".." would walk forever
+ *      upwards. Skipping them is what bounds the recursion on a FINITE
+ *      filesystem - a finite tree with back-references removed cannot
+ *      cycle.
+ *
+ *   3. THE DEPTH LIMIT.  Real filesystems can contain symlink chains or
+ *      bind-mount arrangements that defeat the ".." reasoning (e.g. a
+ *      directory that is its own ancestor through a different path).
+ *      depth is a belt-and-braces backstop: after N levels we stop. Every
+ *      recursive function should have one, because the cost of a runaway
+ *      recursion is a stack overflow and a hang, not just wrong output.
+ *
+ * Each call owns its own frame and its own `nl`, so on return everything
+ * it allocated is released. The call stack grows with the DEPTH of the
+ * tree, not with the number of files - which is why a wide directory is
+ * cheap but a very deep one is not.
+ */
+static void do_ls(const char *path, int depth)
 {
     DIR *dir;
     struct dirent *entry;
     NameList nl;
 
+    /* BASE CASE 1 - not an openable directory. */
     dir = opendir(path);
     if (dir == NULL) {
         perror(path);
         return;
     }
 
+    /* BASE CASE 3 - refuse to go deeper than the limit. */
+    if (depth >= depth_limit) {
+        fprintf(stderr, "ls: maximum recursion depth (%d) reached at %s\n",
+                depth_limit, path);
+        closedir(dir);
+        return;
+    }
+
+    /* `-R` prints a header for every directory it lists, not just the
+       first. Real ls writes it in the form "path:" followed by a newline. */
+    printf("%s:\n", path);
+
     namelist_init(&nl);
 
     /*
      * PHASE 1 - READ EVERYTHING.
-     * We cannot start printing until we know the LONGEST filename, because
-     * the column width depends on it. So the whole directory is slurped
-     * into memory first, and only then printed.
+     * We cannot start printing until we know the LONGEST filename,
+     * because the column width depends on it. So the whole directory is
+     * slurped into memory first, then printed. (Feature-5 adds sorting
+     * to this same phase.)
      */
     errno = 0;
     while ((entry = readdir(dir)) != NULL) {
@@ -703,40 +719,45 @@ static void do_ls(const char *path)
             continue;
         namelist_push(&nl, entry->d_name);
     }
-if (errno != 0)
-        perror("readdir failed");
+    if (errno != 0)
+        perror("readdir");
     closedir(dir);
 
     /*
      * PHASE 1b - SORT.
      *
      * WHY sort HERE and not inside each display function?
-     *   Sorting mutates the array in place and costs O(n log n). Doing it
-     *   once, at the single point where the array is finished being built,
-     *   means every display mode downstream sees a correct order and none
-     *   of them needs to know that sorting even exists.
+     *   Sorting mutates the array in place and is expensive. Doing it once,
+     *   in the single place where the array is finished being built, means
+     *   every display mode downstream sees an already-correct order and
+     *   none of them needs to know that sorting even exists.
      *
      * WHY we must read everything into memory first?
-     *   readdir() returns entries in whatever order the filesystem stores
-     *   them (inode order on ext4, hash order on XFS) and gives no way to
-     *   seek or reorder a live stream. The only place sorting can happen is
-     *   on a materialised array.
+     *   readdir() returns entries in whatever order the filesystem hands
+     *   them over (inode order on ext4, hash order on XFS) and there is no
+     *   way to seek or re-order a live directory stream. The only place
+     *   sorting can happen is on a materialised array.
      *
-     * Arguments: base pointer, element COUNT, element SIZE in bytes, then
-     * the comparison function pointer (no '&' needed - a function name
-     * already decays to a pointer).
+     * The arguments: base pointer, element COUNT, element SIZE in bytes,
+     * then the comparison function pointer (note: no '&' needed, a
+     * function name already decays to a pointer).
      *
-     * GUARD: qsort's first parameter is declared a pointer that "shall not
-     * be null", so qsort(NULL, 0, ...) on an EMPTY directory is formally
-     * undefined behaviour even though glibc tolerates it - UBSan reports
-     * "null pointer passed as argument 1, which is declared to never be
-     * null". Sorting 0 or 1 elements is a no-op anyway, so skipping the
-     * call is both correct and clearer.
-     *
-     * HIDDEN FILES: the reader skips names starting with '.', but the
-     * comparator is indifferent to that - strcmp orders any string and a
-     * leading '.' simply sorts before letters, which is why real ls shows
-     * ".bashrc" first. Adding -a later would need NO change here.
+     * HIDDEN FILES: our reader already skips names beginning with '.', but
+     * the comparator is completely indifferent to that - strcmp orders any
+     * string, and a leading '.' simply sorts before letters, which is why
+     * real ls shows ".bashrc" first. Enabling -a later would need no change
+     * here at all.
+     */
+    /*
+     * GUARD: qsort's first parameter is declared `void *` that "shall not be
+     * a null pointer", so calling qsort(NULL, 0, ...) on an EMPTY directory
+     * is formally undefined behaviour even though glibc happens to tolerate
+     * it. UBSan reports it as
+     *     "null pointer passed as argument 1, which is declared to never
+     *      be null".
+     * Sorting 0 or 1 elements is a no-op anyway, so skipping the call is
+     * both correct and clearer. (Testing count > 1 also guarantees the
+     * array is non-NULL, since namelist_push is what allocates it.)
      */
     if (nl.count > 1)
         qsort(nl.names, nl.count, sizeof(char *), cmp_names);
@@ -755,6 +776,76 @@ if (errno != 0)
         print_columns(&nl, path);
     }
 
+    /*
+     * PHASE 3 - DESCEND.
+     *
+     * A SEPARATE LOOP, not part of the printing loop above. Two reasons:
+     *   1. In MODE_COLUMN the display function decides its OWN internal
+     *      iteration order (row-first, column-second). Descending from
+     *      inside that loop would produce "a b c / a1 b1 c1" - children of
+     *      'a' printed before 'b' and 'c' have even been shown. `ls -R`
+     *      prints the whole level first, THEN recurses. A separate loop
+     *      gives us that ordering naturally.
+     *   2. It keeps the display functions pure with respect to recursion -
+     *      no change was needed inside print_columns/print_across/
+     *      print_long_entry at all.
+     *
+     * THE LOOP MUST SEE A CLEAN STATE. namelist_free() must run BEFORE we
+     * recurse, otherwise every level of the tree holds its own array and
+     * its own strings in memory simultaneously - which is exactly the
+     * unbounded growth the brief warns about. Freeing here means at most
+     * one level's worth of directory entries is live at any moment.
+     */
+    if (recursive) {
+        size_t i;
+        for (i = 0; i < nl.count; i++) {
+            struct stat st;
+            char child[4096];
+
+            /* Redundant with the readdir filter above, but this is the
+               single most important guard in the whole program. "." and
+               ".." are directories; recursing into ".." returns to the
+               PARENT, and recursing into "." returns to THIS SAME
+               directory. The second case is an infinite loop - the base
+               case that would never terminate. */
+            if (strcmp(nl.names[i], ".") == 0 || strcmp(nl.names[i], "..") == 0)
+                continue;
+
+            /*
+             * PATH CONSTRUCTION - the crux of recursive listing.
+             * Every system call resolves relative paths against the
+             * process's CURRENT WORKING DIRECTORY, which never changes
+             * here. So "sub" means "./sub", NOT "parent_dir/sub".
+             * Passing the bare name down would make every nested call
+             * operate on the same directory in the CWD. The only correct
+             * argument is an absolute-or-cumulative path built as
+             *     "<current path>/<entry name>".
+             * snprintf bounds the copy so a deep tree cannot overflow the
+             * buffer; the return value is checked so we never truncate
+             * silently and then stat a wrong path.
+             */
+            if (snprintf(child, sizeof(child), "%s/%s", path, nl.names[i])
+                    >= (int)sizeof(child)) {
+                fprintf(stderr, "ls: path too long, skipping %s/%s\n",
+                        path, nl.names[i]);
+                continue;
+            }
+
+            /*
+             * lstat(), NOT stat(), for the type test. If a subdirectory
+             * contains a symlink back up towards the root, stat() would
+             * report "directory" and we would follow it. lstat() reports
+             * "symlink" instead, so we do not recurse into it - which is
+             * what breaks symlink cycles such as  d/link -> ../d.
+             */
+            if (lstat(child, &st) != 0)
+                continue;            /* vanished or unreadable: skip quietly */
+
+            if (S_ISDIR(st.st_mode))
+                do_ls(child, depth + 1);   /* THE RECURSIVE CALL */
+        }
+    }
+
     namelist_free(&nl);
 }
 
@@ -763,22 +854,24 @@ int main(int argc, char const *argv[])
     int opt;
 
     /*
-     * The optstring "lx" tells getopt() that 'l' and 'x' are valid options
-     * and that NEITHER takes an argument (a ':' after a letter would say it
-     * does).
-     */
-    /*
+     * The optstring "lxR" tells getopt() which letters are valid. A ':'
+     * after a letter would mean that letter TAKES an argument; none of ours
+     * do, so the string is just the three characters. Anything else the
+     * user types comes back as '?' and we reject it.
+     *
      * The cast is required, not cosmetic: getopt() is declared as
      *     int getopt(int, char *const *, const char *)
      * but the base version main() is
      *     int main(int argc, char const *argv[])
-     * which makes argv a `const char **`. Those are incompatible pointer
-     * types. The cast is safe because getopt() may PERMUTE argv and
-     * substitute option values, but it never modifies the strings the
-     * pointers refer to.
+     * which makes argv a `const char **` - an incompatible pointer type.
+     * The cast is safe because getopt() may PERMUTE argv and substitute
+     * option values, but it never modifies the strings themselves.
+     *
+     * Note the difference between the two kinds of state:
+     *   display_mode is MUTUALLY EXCLUSIVE - -l and -x fight each other.
+     *   recursive     is INDEPENDENT     - it combines with either.
      */
-
-    while ((opt = getopt(argc, (char *const *)argv, "lx")) != -1) {
+    while ((opt = getopt(argc, (char *const *)argv, "lxR")) != -1) {
         switch (opt) {
             case 'l':
                 display_mode = MODE_LONG;
@@ -786,21 +879,28 @@ int main(int argc, char const *argv[])
             case 'x':
                 display_mode = MODE_ACROSS;
                 break;
+            case 'R':
+                recursive = 1;
+                break;
             case '?':
             default:
-                fprintf(stderr, "Usage: %s [-lx] [DIRECTORY]...\n", argv[0]);
+                fprintf(stderr, "usage: %s [-lxR] [DIRECTORY]\n", argv[0]);
                 return EXIT_FAILURE;
         }
     }
 
-    /* Flag order decides the winner, so `ls -l -x` ends up horizontal. Real
-       GNU ls rejects that combination; ours lets the last flag win. */
+    /*
+     * The order of the flags decides the winner, so `ls -l -x` ends up
+     * horizontal. Real GNU ls rejects that combination; ours lets the last
+     * flag win, which is a deliberate simplification.
+     *
+     * Depth 0 is the directory the user named; each nested call adds one.
+     */
     if (optind >= argc) {
-        do_ls(".");
+        do_ls(".", 0);
     } else {
         for (int i = optind; i < argc; i++) {
-            printf("Directory listing of %s : \n", argv[i]);
-            do_ls(argv[i]);
+            do_ls(argv[i], 0);
             puts("");
         }
     }
