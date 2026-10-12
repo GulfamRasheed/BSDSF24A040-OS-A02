@@ -1,18 +1,20 @@
 /*
- * ls-v1.3.0.c  --  Feature-4: Horizontal Column Display (-x)
+ * ls-v1.4.0.c  --  Feature-5: Alphabetical Sort (qsort)
  *
  * NEW IN THIS VERSION
- *   A second columnar mode. -x prints left-to-right and wraps to the next
- *   line only when the terminal is full ("across then down").
+ *   Directory entries are sorted alphabetically before being displayed.
+ *   The sort is applied ONCE, centrally, so ALL THREE display modes
+ *   (-l, -x, default) inherit it for free.
  *
  * NEW CONCEPTS
- *   Display-mode state - one enum replaces the boolean opt_long, so three
- *                         mutually exclusive modes can be tracked.
- *   Index-derived column - the column of an item is computed from its index
- *                         instead of from a running cursor.
+ *   qsort()      - the standard library's general purpose sort.
+ *   Function pointer - qsort takes an `int (*)(const void*, const void*)`,
+ *                   which is how we tell it "how to compare".
+ *   void *       - a generic pointer; qsort is type-agnostic and can only
+ *                   speak in void *.
  *
- * INHERITED FROM v1.2.0
- *   Dynamic array, ioctl(TIOCGWINSZ), down-then-across printing, -l.
+ * INHERITED FROM v1.3.0
+ *   Dynamic array, ioctl terminal width, all three display modes.
  */
 
 #include <stdio.h>
@@ -102,6 +104,52 @@ static void namelist_push(NameList *nl, const char *name)
         nl->max_len = strlen(name);
 
     nl->count++;
+}
+
+/*
+ * THE qsort() COMPARISON FUNCTION.
+ *
+ * SIGNATURE
+ *     int cmp_names(const void *a, const void *b);
+ *
+ * The prototype is fixed by the C standard because qsort must call a
+ * function whose argument types it cannot know - it sorts a byte range of
+ * unknown element type.
+ *
+ * WHAT QSORT PASSES
+ *     qsort sorts ELEMENTS, and for each comparison it hands us the
+ *     ADDRESSES OF TWO ELEMENTS. Our elements are `char *`, so each
+ *     argument is really a `char **` and the cast happens TWICE:
+ *
+ *         a  -->  (char **)    points AT our char * slot
+ *           |
+ *           +-->  (char *)     dereference to reach the string itself
+ *
+ *     Getting one dereference wrong is the classic bug when sorting an
+ *     array of pointers with qsort.
+ *
+ * WHY const void *
+ *     - void *  : qsort has no idea whether the array holds int, double or
+ *                 char *, so it can only pass a generic pointer.
+ *     - const  : qsort SORTS IN PLACE but never modifies the elements. The
+ *                 const is a promise to the caller that we only read them,
+ *                 and it lets the function be used on a const array.
+ *
+ * RETURN CONTRACT
+ *     < 0  if *a sorts before *b
+ *     = 0  if equal
+ *     > 0  if *a sorts after *b
+ *     We must never return (a - b): that is arithmetic on unrelated
+ *     addresses, which is undefined behaviour. strcmp() already returns
+ *     exactly the value we need.
+ */
+static int cmp_names(const void *a, const void *b)
+{
+    /* Two dereferences: one to reach the slot, one to reach the string. */
+    const char *sa = *(const char *const *)a;
+    const char *sb = *(const char *const *)b;
+
+    return strcmp(sa, sb);
 }
 
 /* Release every string and the array itself. */
@@ -439,9 +487,43 @@ static void do_ls(const char *path)
             continue;
         namelist_push(&nl, entry->d_name);
     }
-    if (errno != 0)
-        perror("readdir");
+if (errno != 0)
+        perror("readdir failed");
     closedir(dir);
+
+    /*
+     * PHASE 1b - SORT.
+     *
+     * WHY sort HERE and not inside each display function?
+     *   Sorting mutates the array in place and costs O(n log n). Doing it
+     *   once, at the single point where the array is finished being built,
+     *   means every display mode downstream sees a correct order and none
+     *   of them needs to know that sorting even exists.
+     *
+     * WHY we must read everything into memory first?
+     *   readdir() returns entries in whatever order the filesystem stores
+     *   them (inode order on ext4, hash order on XFS) and gives no way to
+     *   seek or reorder a live stream. The only place sorting can happen is
+     *   on a materialised array.
+     *
+     * Arguments: base pointer, element COUNT, element SIZE in bytes, then
+     * the comparison function pointer (no '&' needed - a function name
+     * already decays to a pointer).
+     *
+     * GUARD: qsort's first parameter is declared a pointer that "shall not
+     * be null", so qsort(NULL, 0, ...) on an EMPTY directory is formally
+     * undefined behaviour even though glibc tolerates it - UBSan reports
+     * "null pointer passed as argument 1, which is declared to never be
+     * null". Sorting 0 or 1 elements is a no-op anyway, so skipping the
+     * call is both correct and clearer.
+     *
+     * HIDDEN FILES: the reader skips names starting with '.', but the
+     * comparator is indifferent to that - strcmp orders any string and a
+     * leading '.' simply sorts before letters, which is why real ls shows
+     * ".bashrc" first. Adding -a later would need NO change here.
+     */
+    if (nl.count > 1)
+        qsort(nl.names, nl.count, sizeof(char *), cmp_names);
 
     /* PHASE 2 - PRINT.  Dispatch on the display mode. */
     if (display_mode == MODE_LONG) {
