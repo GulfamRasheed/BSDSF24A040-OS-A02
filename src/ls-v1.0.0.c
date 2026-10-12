@@ -1,20 +1,24 @@
 /*
- * ls-v1.4.0.c  --  Feature-5: Alphabetical Sort (qsort)
+ * ls-v1.5.0.c  --  Feature-6: Colorized Output Based on File Type
  *
  * NEW IN THIS VERSION
- *   Directory entries are sorted alphabetically before being displayed.
- *   The sort is applied ONCE, centrally, so ALL THREE display modes
- *   (-l, -x, default) inherit it for free.
+ *   Filenames are printed in a colour determined by the file's type:
+ *     directory      -> bold blue
+ *     executable     -> green
+ *     archive        -> red
+ *     symlink        -> magenta (pink)
+ *     special file   -> reverse video
  *
  * NEW CONCEPTS
- *   qsort()      - the standard library's general purpose sort.
- *   Function pointer - qsort takes an `int (*)(const void*, const void*)`,
- *                   which is how we tell it "how to compare".
- *   void *       - a generic pointer; qsort is type-agnostic and can only
- *                   speak in void *.
+ *   ANSI escape codes - the terminal emulates a text display, not a
+ *                       graphics one. Colour is produced by printing a
+ *                       short control string the terminal INTERPRETS
+ *                       rather than displays.
+ *   S_ISREG/S_ISDIR/... - macros that test the st_mode type bits.
  *
- * INHERITED FROM v1.3.0
- *   Dynamic array, ioctl terminal width, all three display modes.
+ * INHERITED FROM v1.4.0
+ *   Dynamic array, ioctl terminal width, all three display modes,
+ *   alphabetical sort, and the complete -l long listing.
  */
 
 #include <stdio.h>
@@ -217,7 +221,181 @@ static int terminal_width(void)
  *   columns are one row taller. The `c * num_rows + r` formula plus
  *   bounds-checking reproduces that automatically.
  */
-static void print_columns(const NameList *nl)
+/* --- ANSI escape codes ------------------------------------------------- */
+
+/*
+ * HOW TERMINAL COLOUR WORKS
+ *
+ * A terminal is fundamentally a character grid: it displays bytes. It has
+ * no colour primitive of its own. The illusion of colour is produced by a
+ * convention inherited from the DEC VT100: a byte sequence beginning with
+ * ESC (0x1B) is not displayed as text but is CONSUMED by the terminal as a
+ * command that changes the terminal's internal state - much like changing
+ * a printer setting. The screen is then repainted in that new state.
+ *
+ * The general shape is:
+ *
+ *     ESC [ <parameter bytes> <final byte>
+ *
+ *   ESC       = 0x1B, written in C as "\033" or "\x1B"
+ *   '['       = introduces a CSI (Control Sequence Introducer)
+ *   final byte= the command letter
+ *
+ * The SGR ("Select Graphic Rendition") command is the colour one, final
+ * byte 'm'. Its parameters are semicolon separated:
+ *
+ *     0   reset everything           30-37  normal fg colours
+ *     1   bold / bright              40-47  normal bg colours
+ *     2   faint                     90-97  bright fg colours
+ *     7   reverse video             40-47  bright bg colours
+ *     22  bold off                  39     default fg
+ *
+ * The "0" before the colour number means "reset, then set", which is why
+ * the textbook green is "\033[0;32m" rather than the shorter "\033[32m".
+ *
+ * CONSEQUENCE FOR US: the escape bytes go to STDOUT like any other bytes.
+ * If stdout is a pipe or a file, nothing interprets them, so a redirected
+ * `ls > out.txt` would contain literal control garbage. Real ls guards
+ * against this with isatty(); so do we, in use_color() below.
+ */
+#define ANSI_RESET     "\033[0m"
+#define ANSI_DIR       "\033[1;34m"    /* bold blue                     */
+#define ANSI_EXEC      "\033[1;32m"    /* bold green                    */
+#define ANSI_ARCHIVE   "\033[1;31m"    /* bold red                      */
+#define ANSI_LINK      "\033[1;35m"    /* bold magenta (pink)           */
+#define ANSI_SPECIAL   "\033[7m"       /* reverse video                 */
+
+/* Archive suffixes the brief asks for, plus the common compound ones. */
+static const char *const archive_ext[] = {
+    ".tar", ".gz", ".zip", ".tgz", ".bz2", ".xz", ".tar.gz", ".tar.bz2", NULL
+};
+
+/*
+ * TRUE if `name` ends with one of the archive suffixes.
+ *
+ * strrchr(name, '.') finds the LAST dot - the correct one, because
+ * "report.2024.final" must be tested against "final", not against "2024".
+ * We then compare that tail against each suffix with an explicit length
+ * check plus strcmp, which is an equality test AT THE END. strstr() alone
+ * would wrongly match a substring in the middle, so "my.gzfile" would be
+ * coloured as if it were an archive.
+ */
+static int has_archive_ext(const char *name)
+{
+    const char *dot = strrchr(name, '.');
+    int i;
+
+    if (dot == NULL)
+        return 0;
+
+    for (i = 0; archive_ext[i] != NULL; i++) {
+        size_t nl = strlen(dot);
+        size_t el = strlen(archive_ext[i]);
+        if (nl == el && strcmp(dot, archive_ext[i]) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * Decide the colour for one entry from its already-fetched st_mode.
+ *
+ * ORDER MATTERS - the tests are ordered most specific to least, because
+ * each one narrows what can still be true:
+ *   1. symlink   - a link pointing at a directory must STILL be pink, so
+ *                  this must be tested BEFORE the directory test.
+ *   2. directory
+ *   3. special   - character/block devices, FIFOs, sockets.
+ *   4. executable - via the execute bits; only meaningful for regular files.
+ *   5. archive   - matched on the NAME, because the filesystem itself has
+ *                  no concept of "archive"; only the name does.
+ *   6. default   - ordinary data file, terminal's own colour.
+ *
+ * We take st_mode as a parameter rather than the path, so the caller can
+ * lstat() ONCE per entry and reuse the result. A version that called
+ * lstat() inside this function would work too, but would be slower when
+ * the caller also needs the metadata.
+ */
+static const char *color_for_mode(const char *name, mode_t mode)
+{
+    if (S_ISLNK(mode))                      return ANSI_LINK;
+    if (S_ISDIR(mode))                      return ANSI_DIR;
+    if (S_ISCHR(mode) || S_ISBLK(mode) ||
+        S_ISFIFO(mode) || S_ISSOCK(mode))   return ANSI_SPECIAL;
+
+    /*
+     * EXECUTABLE TEST.
+     * st_mode stores the execute bit THREE times - once per class of user -
+     * because a file can be executable by its owner but not by others. If
+     * ANY of the three is set we call it executable, matching GNU ls:
+     *     S_IXUSR   owner may execute    0100 octal
+     *     S_IXGRP   group may execute    0010 octal
+     *     S_IXOTH   others may execute   0001 octal
+     */
+    if (mode & (S_IXUSR | S_IXGRP | S_IXOTH))
+        return ANSI_EXEC;
+
+    if (has_archive_ext(name))             return ANSI_ARCHIVE;
+
+    return "";                              /* terminal default colour */
+}
+
+/*
+ * Colour only when stdout is a real terminal.
+ *
+ * isatty(1) is true only when file descriptor 1 is attached to a terminal.
+ * Redirecting to a file or piping into another program makes it false, and
+ * we then suppress all escape codes. This MUST exist, otherwise
+ * `ls > out.txt` writes raw ESC bytes into the file.
+ */
+static int use_color(void)
+{
+    return isatty(STDOUT_FILENO);
+}
+
+/*
+ * Print one filename in its colour, optionally padded to `col_width`.
+ *
+ * ALIGNMENT SUBTLETY - the most important detail in this feature.
+ * The escape codes are invisible on screen but they DO count as bytes.
+ * Passing an already-coloured string to `%-*s` would therefore mis-pad
+ * every column by the length of the escape sequence and the whole grid
+ * would collapse. The fix is to emit the colour code, pad and print ONLY
+ * the bare name, then emit the reset code AFTER the padding. The terminal
+ * renders the escape bytes as zero-width, so the visible width is exactly
+ * col_width.
+ */
+static void print_colored_padded(const char *path, const char *name,
+                                 int col_width, int pad)
+{
+    struct stat st;
+    const char *code = "";
+
+    /* The isatty() gate lives HERE, in the one place every columnar print
+       funnels through, rather than being repeated at each call site.
+       When stdout is a pipe or a file we emit no escape bytes at all, so
+       `ls > out.txt` contains clean text. */
+    if (use_color() && lstat(path, &st) == 0) {
+        code = color_for_mode(name, st.st_mode);
+    }
+    /* If lstat failed we still print the name, just without colour - one
+       unreadable entry must not abort the whole listing. */
+
+    if (code[0] != '\0')
+        fputs(code, stdout);
+
+    if (pad)
+        printf("%-*s", col_width, name);
+    else
+        printf("%s", name);
+
+    if (code[0] != '\0')
+        fputs(ANSI_RESET, stdout);
+}
+
+/* Colour only when stdout is a real terminal. */
+/* Print the name list in GNU ls "down then across" order. */
+static void print_columns(const NameList *nl, const char *path)
 {
     int width = terminal_width();
     size_t col_width;
@@ -234,8 +412,12 @@ static void print_columns(const NameList *nl)
     if ((size_t)width <= col_width) {
         /* Names too wide to share a line - print one per line. */
         size_t i;
-        for (i = 0; i < nl->count; i++)
-            printf("%s\n", nl->names[i]);
+        for (i = 0; i < nl->count; i++) {
+            char full[4096];
+            snprintf(full, sizeof(full), "%s/%s", path, nl->names[i]);
+            print_colored_padded(full, nl->names[i], 0, 0);
+            putchar('\n');
+        }
         return;
     }
 
@@ -246,20 +428,25 @@ static void print_columns(const NameList *nl)
     for (r = 0; r < num_rows; r++) {
         for (c = 0; c < num_cols; c++) {
             size_t idx = c * num_rows + r;
+            char full[4096];
 
             if (idx >= nl->count)
                 continue;              /* ragged last column */
 
+            snprintf(full, sizeof(full), "%s/%s", path, nl->names[idx]);
+
             /* TRAILING-WHITESPACE FIX.
-               Pad only when a REAL item further along this row exists:
-                 - a next column exists on this row     (c + 1 < num_cols)
-                 - that next column actually has a name (idx+num_rows < count)
-               Padding the final item of a row would leave spaces at the
-               end of the line, which real ls never emits. */
+               Pad only when there is a REAL item further along this row.
+               Two conditions must both hold:
+                 - a next column exists on this row      (c + 1 < num_cols)
+                 - that next column actually has a name  (idx+num_rows < count)
+               Padding the final item of a row would leave spaces after the
+               colour reset, which real ls never emits and which show up as
+               noise in `ls | cat -A`. */
             if (c + 1 < num_cols && idx + num_rows < nl->count)
-                printf("%-*s", (int)col_width, nl->names[idx]);
+                print_colored_padded(full, nl->names[idx], (int)col_width, 1);
             else
-                printf("%s", nl->names[idx]);
+                print_colored_padded(full, nl->names[idx], 0, 0);
         }
         putchar('\n');
     }
@@ -268,16 +455,21 @@ static void print_columns(const NameList *nl)
 /*
  * Print the name list left-to-right, wrapping at the terminal edge.
  *
- * WHY THIS IS SIMPLER THAN print_columns()
+ * WHY THIS IS FAR SIMPLER THAN print_columns()
  *   print_columns() must know num_rows BEFORE it prints anything, because
  *   row r / column c maps to index c * num_rows + r. num_rows depends on
- *   num_cols, which depends on the longest name AND the terminal width, so
- *   a full two-dimensional layout has to be computed up front.
+ *   num_cols, which depends on the longest name AND the terminal width -
+ *   so it has to compute a full two-dimensional layout up front.
  *
  *   Here the mapping is trivial: index i goes to (row i / num_cols,
- *   column i % num_cols). We never need the total number of rows.
+ *   column i % num_cols). We never need to know the total number of rows
+ *   at all. Instead we keep ONE running variable, `used`, holding how many
+ *   characters we have already written on the current line. Before printing
+ *   the next name we ask: "would this name + padding still fit?" If not, we
+ *   emit '\n' and reset used to zero. That is the whole algorithm - it is
+ *   a streaming, single-pass solution with no look-ahead.
  */
-static void print_across(const NameList *nl)
+static void print_across(const NameList *nl, const char *path)
 {
     int width = terminal_width();
     size_t col_width;
@@ -291,8 +483,12 @@ static void print_across(const NameList *nl)
 
     /* Same degenerate case as before: a name wider than the screen. */
     if ((size_t)width <= col_width) {
-        for (i = 0; i < nl->count; i++)
-            printf("%s\n", nl->names[i]);
+        for (i = 0; i < nl->count; i++) {
+            char full[4096];
+            snprintf(full, sizeof(full), "%s/%s", path, nl->names[i]);
+            print_colored_padded(full, nl->names[i], 0, 0);
+            putchar('\n');
+        }
         return;
     }
 
@@ -300,10 +496,14 @@ static void print_across(const NameList *nl)
 
     for (i = 0; i < nl->count; i++) {
         size_t col = i % num_cols;   /* which column of the line */
+        char full[4096];
         int pad;
 
-        /* WRAP. `i` starts a new line whenever it is in column 0 and is
-           not the first item overall. */
+        /* WRAP: index i starts a new line whenever it sits in column 0 and
+           is not the very first item. This is the horizontal equivalent of
+           the brief's "track the cursor and print '\n' when the next name
+           would not fit". Deriving the column from the index is what keeps
+           the grid aligned - see the note below. */
         if (col == 0 && i > 0)
             putchar('\n');
 
@@ -312,29 +512,29 @@ static void print_across(const NameList *nl)
          *
          * The intuitive version keeps a variable `used` holding the current
          * column and pads while `used + col_width <= width`. That looks
-         * right but is WRONG. A padded item occupies the FULL col_width on
-         * screen, whereas an unpadded item occupies only its own length. If
-         * `used` counts the padded case correctly but the unpadded case
-         * only by len(), then after a line-final bare item `used` is no
-         * longer a multiple of col_width and every later wrap test is off
-         * by the missing padding - producing "alpha.txtsub2" with no gap.
+         * right but is WRONG, and the reason is worth understanding: a
+         * padded item occupies the FULL col_width on screen, whereas an
+         * unpadded item occupies only its own length. If `used` counts the
+         * padded case correctly but the unpadded case only by len(), then
+         * after a line-final bare item `used` is no longer a multiple of
+         * col_width, and every later wrap test is off by the missing
+         * padding. The visible symptom is a long name glued onto the next
+         * one ("alpha.txtsub2") with no gap between them.
          *
          * Deriving the column from the index - col = i % num_cols - removes
-         * the whole class of bug, because the item-to-position mapping is a
-         * pure function of the index and can never drift. Padding then
-         * reduces to "is this the last column that still has content?".
+         * the entire class of bug, because the item-to-position mapping is
+         * a pure function of the index and can never drift. Padding then
+         * reduces to "is this the last column that still has content?"
          */
         pad = (col + 1 < num_cols) && (i + 1 < nl->count);
 
-        if (pad)
-            printf("%-*s", (int)col_width, nl->names[i]);
-        else
-            printf("%s", nl->names[i]);
+        snprintf(full, sizeof(full), "%s/%s", path, nl->names[i]);
+        print_colored_padded(full, nl->names[i], pad ? (int)col_width : 0, pad);
     }
 
+    /* Trailing newline so the shell prompt starts on a fresh line. */
     putchar('\n');
 }
-
 /* --- long listing (unchanged from v1.1.0) ------------------------------ */
 
 static void mode_to_perms(mode_t mode, char *out)
@@ -436,14 +636,30 @@ static void print_long_entry(const char *path, const char *name)
      *   | size 9 right | time 12 | name
      * The * and - flags of printf are how C does column alignment.
      */
-    printf("%s %3lu %-8s %-8s %9ld %s %s",
+    /*
+     * All the metadata columns print plainly; only the NAME is coloured,
+     * and it is coloured from the SAME st_mode fetched above - no second
+     * lstat() call is needed.
+     */
+    printf("%s %3lu %-8s %-8s %9ld %s ",
            perms,
            (unsigned long)info.st_nlink,
            pwd ? pwd->pw_name : "UNKNOWN",
            grp ? grp->gr_name : "UNKNOWN",
            (long)info.st_size,
-           timebuf,
-           name);
+           timebuf);
+
+    if (use_color()) {
+        const char *code = color_for_mode(name, info.st_mode);
+        if (code[0] != '\0')
+            fputs(code, stdout);
+    }
+
+    /* In -l mode the name is the last column, so it needs no padding. */
+    fputs(name, stdout);
+
+    if (use_color())
+        fputs(ANSI_RESET, stdout);
 
     /* Symlinks get "-> target" at the end, exactly like real ls. */
     if (S_ISLNK(info.st_mode)) {
@@ -534,9 +750,9 @@ if (errno != 0)
             print_long_entry(full, nl.names[i]);
         }
     } else if (display_mode == MODE_ACROSS) {
-        print_across(&nl);
+        print_across(&nl, path);
     } else {
-        print_columns(&nl);
+        print_columns(&nl, path);
     }
 
     namelist_free(&nl);
