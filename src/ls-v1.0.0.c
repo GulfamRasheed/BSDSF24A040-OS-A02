@@ -1,24 +1,18 @@
 /*
- * ls-v1.2.0.c  --  Feature-3: Column Display, "Down Then Across"
- *
- * BASE: the instructor's lsv1.0.0. do_ls() keeps its name and its role,
- * but is split into two phases (read everything, then print) because the
- * column width depends on the LONGEST filename and cannot be known until
- * the last entry has been seen.
+ * ls-v1.3.0.c  --  Feature-4: Horizontal Column Display (-x)
  *
  * NEW IN THIS VERSION
- *   Default output is multi-column and adapts to the terminal width.
+ *   A second columnar mode. -x prints left-to-right and wraps to the next
+ *   line only when the terminal is full ("across then down").
  *
  * NEW CONCEPTS
- *   Dynamic array    - realloc() doubling, so memory grows with the
- *                       directory instead of being a fixed guess.
- *   ioctl(TIOCGWINSZ) - ask the kernel how wide the terminal is.
- *   Down-then-across - print column-major: fill a column top to bottom,
- *                       then move to the next column.
+ *   Display-mode state - one enum replaces the boolean opt_long, so three
+ *                         mutually exclusive modes can be tracked.
+ *   Index-derived column - the column of an item is computed from its index
+ *                         instead of from a running cursor.
  *
- * NEW SYSTEM CALLS
- *   ioctl()   - device control; TIOCGWINSZ returns a struct winsize
- *   realloc() - resize a heap block, copying the old contents
+ * INHERITED FROM v1.2.0
+ *   Dynamic array, ioctl(TIOCGWINSZ), down-then-across printing, -l.
  */
 
 #include <stdio.h>
@@ -34,7 +28,22 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>     /* struct winsize, TIOCGWINSZ */
 
-static int opt_long = 0;
+/*
+ * Display mode.
+ *
+ * We replace the `int opt_long` boolean with an enum because there are now
+ * THREE mutually exclusive states. A boolean cannot express "neither of the
+ * two things I have flags for", so with two booleans we would also need
+ * extra code to decide which one wins when both are set. An enum makes the
+ * state space explicit and impossible to contradict.
+ */
+typedef enum {
+    MODE_COLUMN,    /* default : down then across */
+    MODE_LONG,      /* -l      : one file per line with metadata */
+    MODE_ACROSS     /* -x      : left to right, then wrap */
+} DisplayMode;
+
+static DisplayMode display_mode = MODE_COLUMN;
 
 /* --- constants --------------------------------------------------------- */
 #define NAME_SPACING 2      /* blank columns between adjacent columns      */
@@ -208,6 +217,76 @@ static void print_columns(const NameList *nl)
     }
 }
 
+/*
+ * Print the name list left-to-right, wrapping at the terminal edge.
+ *
+ * WHY THIS IS SIMPLER THAN print_columns()
+ *   print_columns() must know num_rows BEFORE it prints anything, because
+ *   row r / column c maps to index c * num_rows + r. num_rows depends on
+ *   num_cols, which depends on the longest name AND the terminal width, so
+ *   a full two-dimensional layout has to be computed up front.
+ *
+ *   Here the mapping is trivial: index i goes to (row i / num_cols,
+ *   column i % num_cols). We never need the total number of rows.
+ */
+static void print_across(const NameList *nl)
+{
+    int width = terminal_width();
+    size_t col_width;
+    size_t num_cols;
+    size_t i;
+
+    if (nl->count == 0)
+        return;
+
+    col_width = nl->max_len + NAME_SPACING;
+
+    /* Same degenerate case as before: a name wider than the screen. */
+    if ((size_t)width <= col_width) {
+        for (i = 0; i < nl->count; i++)
+            printf("%s\n", nl->names[i]);
+        return;
+    }
+
+    num_cols = (size_t)width / col_width;
+
+    for (i = 0; i < nl->count; i++) {
+        size_t col = i % num_cols;   /* which column of the line */
+        int pad;
+
+        /* WRAP. `i` starts a new line whenever it is in column 0 and is
+           not the first item overall. */
+        if (col == 0 && i > 0)
+            putchar('\n');
+
+        /*
+         * PADDING - and why we deliberately do NOT track a running cursor.
+         *
+         * The intuitive version keeps a variable `used` holding the current
+         * column and pads while `used + col_width <= width`. That looks
+         * right but is WRONG. A padded item occupies the FULL col_width on
+         * screen, whereas an unpadded item occupies only its own length. If
+         * `used` counts the padded case correctly but the unpadded case
+         * only by len(), then after a line-final bare item `used` is no
+         * longer a multiple of col_width and every later wrap test is off
+         * by the missing padding - producing "alpha.txtsub2" with no gap.
+         *
+         * Deriving the column from the index - col = i % num_cols - removes
+         * the whole class of bug, because the item-to-position mapping is a
+         * pure function of the index and can never drift. Padding then
+         * reduces to "is this the last column that still has content?".
+         */
+        pad = (col + 1 < num_cols) && (i + 1 < nl->count);
+
+        if (pad)
+            printf("%-*s", (int)col_width, nl->names[i]);
+        else
+            printf("%s", nl->names[i]);
+    }
+
+    putchar('\n');
+}
+
 /* --- long listing (unchanged from v1.1.0) ------------------------------ */
 
 static void mode_to_perms(mode_t mode, char *out)
@@ -364,14 +443,16 @@ static void do_ls(const char *path)
         perror("readdir");
     closedir(dir);
 
-    /* PHASE 2 - PRINT. */
-    if (opt_long) {
+    /* PHASE 2 - PRINT.  Dispatch on the display mode. */
+    if (display_mode == MODE_LONG) {
         size_t i;
         for (i = 0; i < nl.count; i++) {
             char full[4096];
             snprintf(full, sizeof(full), "%s/%s", path, nl.names[i]);
             print_long_entry(full, nl.names[i]);
         }
+    } else if (display_mode == MODE_ACROSS) {
+        print_across(&nl);
     } else {
         print_columns(&nl);
     }
@@ -384,6 +465,11 @@ int main(int argc, char const *argv[])
     int opt;
 
     /*
+     * The optstring "lx" tells getopt() that 'l' and 'x' are valid options
+     * and that NEITHER takes an argument (a ':' after a letter would say it
+     * does).
+     */
+    /*
      * The cast is required, not cosmetic: getopt() is declared as
      *     int getopt(int, char *const *, const char *)
      * but the base version main() is
@@ -394,18 +480,23 @@ int main(int argc, char const *argv[])
      * pointers refer to.
      */
 
-    while ((opt = getopt(argc, (char *const *)argv, "l")) != -1) {
+    while ((opt = getopt(argc, (char *const *)argv, "lx")) != -1) {
         switch (opt) {
-            case 'l': opt_long = 1; break;
+            case 'l':
+                display_mode = MODE_LONG;
+                break;
+            case 'x':
+                display_mode = MODE_ACROSS;
+                break;
             case '?':
             default:
-                fprintf(stderr, "Usage: %s [-l] [DIRECTORY]...\n", argv[0]);
+                fprintf(stderr, "Usage: %s [-lx] [DIRECTORY]...\n", argv[0]);
                 return EXIT_FAILURE;
         }
     }
 
-    /* Same argument handling as the base version: no argument means the
-       current directory; otherwise list every directory given. */
+    /* Flag order decides the winner, so `ls -l -x` ends up horizontal. Real
+       GNU ls rejects that combination; ours lets the last flag win. */
     if (optind >= argc) {
         do_ls(".");
     } else {
